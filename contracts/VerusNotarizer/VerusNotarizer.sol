@@ -25,7 +25,10 @@ contract VerusNotarizer is VerusStorage {
         BRIDGE = Bridge;
         VERUS = Verus;
     }
-        
+
+    //reset to empty 9-July-26
+    function initialize() external {}
+
     uint8 constant FORKS_DATA_OFFSET_FOR_HEIGHT = 224;
 
     uint32 constant FORKS_DATA_CONFIRMED_PROPOSER = 96;
@@ -46,7 +49,9 @@ contract VerusNotarizer is VerusStorage {
     function setLatestData(bytes calldata serializedNotarization, bytes32 txid, uint32 n, bytes calldata data
         ) external {
 
-        require(!knownNotarizationTxids[txid], "known TXID");
+        if (claimableFees[VerusConstants.VDXF_DISABLE_CONTRACT_KEY] & VerusConstants.HALT_NOTARIZATIONS != 0) revert("Bridge halted");
+
+        require(!knownNotarizationTxids[txid]);
         knownNotarizationTxids[txid] = true;
 
         (uint8[] memory _vs,
@@ -54,6 +59,7 @@ contract VerusNotarizer is VerusStorage {
         bytes32[] memory _ss,
         uint32[] memory blockheights,
         address[] memory notaryAddresses) = abi.decode(data,(uint8[],bytes32[], bytes32[],uint32[],address[]));
+        require(blockheights.length == notaryAddresses.length);
 
         bytes32 keccakNotarizationHash;
         bytes32 txidHash;
@@ -82,7 +88,14 @@ contract VerusNotarizer is VerusStorage {
             bytes32 hashedNotarizationByID;
             // hash the notarizations with the vdxf key, system, height & NotaryID. the address is masked in 98 bytes in .
             assembly {
+                // Update serialized blockheight for this notary (data bytes 74-77, at bits [31:0] of word at offset 78).
+                // serializeUint32 byte-swap performed inline: reverses 4 bytes of blockheights[i].
+                let bh := mload(add(blockheights, mul(add(i, 1), 32)))
+                let sbh := or(or(shl(24, and(bh, 0xFF)), shl(8, and(bh, 0xFF00))), or(shr(8, and(bh, 0xFF0000)), shr(24, and(bh, 0xFF000000))))
+                mstore(add(tempBytes, 78), or(and(mload(add(tempBytes, 78)), not(0xFFFFFFFF)), sbh))
+                // Update notary address for this iteration (the existing mask preserves VERUS-tail + updated blockheights).
                 mstore(add(tempBytes, 98), or(and(mload(add(tempBytes, 98)), shl(160, 0xffffffffffffffffffffffff)), mload(add(notaryAddresses, mul(add(i,1), 32)))))
+                
                 hashedNotarizationByID := keccak256(add(tempBytes, 0x20), mload(tempBytes))
             }
 
@@ -118,7 +131,15 @@ contract VerusNotarizer is VerusStorage {
         require(success);
 
         (bytes32 launchedAndProposer, bytes32 prevnotarizationtxid, bytes32 hashprevnotarization, bytes32 stateRoot, 
-                uint32 verusProofheight) = abi.decode(returnBytes, (bytes32, bytes32, bytes32, bytes32, uint32));
+                uint32 verusProofheight, address votetxid, uint256 reserves) = abi.decode(returnBytes, (bytes32, bytes32, bytes32, bytes32, uint32, address, uint256));
+
+        if (votetxid != address(0)) {
+            castVote(votetxid);
+        }
+
+        if( reserves != 0) {
+            claimableFees[bytes32(uint256(uint160(VerusConstants.VDXF_ETH_DAI_VRSC_LAST_RESERVES)))] = reserves;
+        }
 
         voutAndHeight |= uint64(verusProofheight) << 32; // pack two 32bit numbers into one uint64
         launchedAndProposer |= bytes32(uint256(voutAndHeight) << VerusConstants.NOTARIZATION_VOUT_NUM_INDEX); // Also pack in the voutnum at the end of the uint256
@@ -140,6 +161,39 @@ contract VerusNotarizer is VerusStorage {
             }
         }
         emit NewNotarization(blakeNotarizationHash);
+    }
+
+    function castVote(address votetxid) private {
+
+        // If the vote is address(0) and the vote has not started, or the vote hash has already been used, return
+        if ((votetxid == address(0) && rollingVoteIndex == VerusConstants.DEFAULT_INDEX_VALUE)
+                || successfulVoteHashes[votetxid] == VerusConstants.MAX_UINT256) {
+            return;
+        }
+
+        // if the vote hash has not been used, save the vote start timestamp
+        if(votetxid != address(0) && successfulVoteHashes[votetxid] == 0) {
+            successfulVoteHashes[votetxid] = block.timestamp;
+        } else if (votetxid != address(0) && (block.timestamp - successfulVoteHashes[votetxid]) > (VerusConstants.SECONDS_IN_DAY * 20)) {
+            // if 20 days have passed since the vote started, set the vote hash as used
+            successfulVoteHashes[votetxid] = VerusConstants.MAX_UINT256;
+
+            // reset the rolling vote index to DEFAULT, if there are other hashes they will continue, otherwise voting will go idle.
+            rollingVoteIndex = VerusConstants.DEFAULT_INDEX_VALUE;
+            return;
+        }
+        
+        if(rollingVoteIndex >= (VerusConstants.VOTE_LENGTH - 1)) {
+            rollingVoteIndex = 0;
+        } else {
+            rollingVoteIndex = rollingVoteIndex + 1;
+        }
+
+        // save an empty global write if the value to be written is the same as the current value
+        if (votetxid != rollingUpgradeVotes[rollingVoteIndex]) {
+            rollingUpgradeVotes[rollingVoteIndex] = votetxid;
+        }
+
     }
 
     function decodeNotarization(uint index) public view returns (VerusObjectsNotarization.NotarizationForks[] memory)
@@ -269,6 +323,15 @@ contract VerusNotarizer is VerusStorage {
         {
             encodeNotarization(uint(forkIdx), VerusObjectsNotarization.NotarizationForks(hashedNotarization,
                 txidHash, proposer));
+            // Write proofs entry so that if this notarization later becomes confirmed via fork resolution,
+            // getLastConfirmedVRSCStateRoot() can find its stateRoot. Without this, a fork resolution sets
+            // bestForks[0] slot 2 to this notarization's height, but proofs[height] would be empty.
+            // Guard: notarizations is only populated when bestForks was non-empty (i.e. a previous
+            // notarization existed). On the very first call bestForks is empty and notarizations has
+            // length 0, so accessing notarizations[forkPos] would panic with array out-of-bounds.
+            if (notarizations.length > 0) {
+                proofs[bytes32(uint256(uint32(uint256(proposer >> FORKS_DATA_OFFSET_FOR_HEIGHT))))] = abi.encodePacked(stateRoot, uint32(uint256(notarizations[uint(forkPos)].proposerPacked) >> FORKS_DATA_OFFSET_FOR_HEIGHT));
+            }
         }
     }
 
@@ -300,6 +363,8 @@ contract VerusNotarizer is VerusStorage {
 
         uint256 proposerAndHeight;
         bytes memory tempBytes = bestForks[0];
+
+        verusToERC20mapping[VETH].tokenIndex += msg.value / VerusConstants.SATS_TO_WEI_STD;
 
         assembly {
             proposerAndHeight := mload(add(tempBytes, FORKS_DATA_CONFIRMED_PROPOSER))

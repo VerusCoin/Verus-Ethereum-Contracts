@@ -10,6 +10,7 @@ import "../VerusBridge/VerusSerializer.sol";
 import "./NotarizationSerializer.sol";
 import "../MMR/VerusBlake2b.sol";
 import "../VerusBridge/UpgradeManager.sol";
+import "../Libraries/BridgeHalt.sol";
 import "../Storage/StorageMaster.sol";
 import "../VerusBridge/Token.sol";
 import "../VerusBridge/TokenManager.sol";
@@ -26,26 +27,33 @@ contract NotaryTools is VerusStorage {
 
     using VerusBlake2b for bytes;
 
-    function initialize() external {
-
-        // 0xf7893a5c9175baa68c3d88eb145012ca40c90c59 == 20bytes hex of vwBTC.vETH@ (iS3NjE3XRYWoHRoovpLhFnbDraCq7NFStf)
-        uint256 currencyAmountInContract = verusToERC20mapping[0xF7893a5c9175bAa68C3d88EB145012CA40C90C59].tokenIndex;
-        // 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599 == ERC20 Contract address of Wrapped BTC (WBTC)
-        uint256 actualBalance = IERC20(0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599).balanceOf(address(this));
-
-        uint256 amountToSend = actualBalance - currencyAmountInContract - 5809652;
-
-        // Send 0.05809652 WBTC (8 decimals) to owed address
-        IERC20(0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599).transfer(0x16770EafcdBEFf2AE73ccD680694f53a8D40df55, 5809652);
-        if (amountToSend > 0) {
-            // if there is any excess, send it to a refund address;
-            IERC20(0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599).transfer(0x8727eE29C1C88b5b2a0Fed4721F92Cc9cd44583b, amountToSend);
-        }
-    }
+    //reset to empty 9-July-26
+    function initialize() external {}
     
     function updateNotarizer(address notarizer, address mainAddress, address revokeAddress, uint8 state) private
     {
         notaryAddressMapping[notarizer] = VerusObjects.notarizer(mainAddress, revokeAddress, state);
+    }
+
+    event BridgeTemporarilyHalted();
+
+    // Revoking notaries (themselves, or by multisig) is what triggers CONTRACTS_TEMPORARY_HALTED:
+    // once more than 3 are revoked the bridge latches into the temporary halt. Recovering notaries does NOT
+    // lift it; a quorum of valid notaries must vote to unhalt (PendingImports.submitUnhaltVote).
+    // Not triggered while permanently halted, as the permanent halt already stops all value movement.
+    function _haltIfTooManyRevoked() private {
+        if (BridgeHalt.isTemporarilyHalted(storageGlobal) || BridgeHalt.isPermanentlyHalted(storageGlobal)) return;
+
+        uint revokedCount;
+        for (uint i = 0; i < notaries.length; i++) {
+            if (notaryAddressMapping[notaries[i]].state == VerusConstants.NOTARY_REVOKED) {
+                revokedCount++;
+            }
+        }
+        if (revokedCount >= BridgeHalt.revokedHaltThreshold(notaries.length)) {
+            BridgeHalt.enterTemporaryHalt(storageGlobal, claimableFees);
+            emit BridgeTemporarilyHalted();
+        }
     }
 
     function recoverString(bytes memory be, uint8 vs, bytes32 rs, bytes32 ss) public pure returns (address)
@@ -64,6 +72,7 @@ contract NotaryTools is VerusStorage {
             if(msg.sender == notaryAddressMapping[notaries[i]].main) {
                 require(notaryAddressMapping[notaries[i]].state == VerusConstants.NOTARY_VALID, "Notary not Valid");
                 notaryAddressMapping[notaries[i]].state = VerusConstants.NOTARY_REVOKED;
+                _haltIfTooManyRevoked();
                 return true;
             }
         }
@@ -99,7 +108,7 @@ contract NotaryTools is VerusStorage {
         require(counter >= ((notaries.length >> 1) + 1), "not enough signatures");
 
         notaryAddressMapping[notarizerBeingRevoked].state = VerusConstants.NOTARY_REVOKED;
-
+        _haltIfTooManyRevoked();
         return true;
     }
 
@@ -116,7 +125,7 @@ contract NotaryTools is VerusStorage {
         require(_newRecoveryInfo.upgradeType == TYPE_RECOVER, "Wrong type of package");
         require(notaryAddressMapping[_newRecoveryInfo.notarizerID].state == VerusConstants.NOTARY_REVOKED, "Notary not revoked");
         
-        be = bytesToString(abi.encodePacked(_newRecoveryInfo.contracts[0],_newRecoveryInfo.contracts[1], uint8(_newRecoveryInfo.upgradeType), _newRecoveryInfo.salt));
+        be = bytesToString(abi.encodePacked(uint8(TYPE_RECOVER), _newRecoveryInfo.contracts[0], _newRecoveryInfo.contracts[1], _newRecoveryInfo.salt));
 
         address signer = recoverString(be, _newRecoveryInfo._vs, _newRecoveryInfo._rs, _newRecoveryInfo._ss);
 
@@ -161,10 +170,9 @@ contract NotaryTools is VerusStorage {
         require(counter >= ((notaries.length >> 1) + 1), "not enough sigs");
 
         updateNotarizer(notarizerBeingRecovered, newMainAddr, newRevokeAddr, VerusConstants.NOTARY_VALID);
-
         return COMPLETE;
     }
-    
+
     function bytesToString (bytes memory input) private pure returns (bytes memory output)
     {
         bytes memory _string = new bytes(input.length * 2);
@@ -195,7 +203,7 @@ contract NotaryTools is VerusStorage {
         }
         else 
         {   
-            output = abi.encodePacked(uint8(254),uint8(newNumber & 0xff),uint8(newNumber >> 8),uint8(newNumber >> 16),uint8(newNumber >> 24),uint8(newNumber >> 32),uint8(newNumber >> 40),uint8(newNumber >> 48),uint8(newNumber >> 56));
+            output = abi.encodePacked(uint8(255),uint8(newNumber & 0xff),uint8(newNumber >> 8),uint8(newNumber >> 16),uint8(newNumber >> 24),uint8(newNumber >> 32),uint8(newNumber >> 40),uint8(newNumber >> 48),uint8(newNumber >> 56));
         }
         return output;
     }

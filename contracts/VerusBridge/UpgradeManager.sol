@@ -19,20 +19,68 @@ contract UpgradeManager is VerusStorage {
     uint8 constant UPGRADE_IN_PROCESS = 3;
     uint8 constant ERROR = 4;
     uint8 constant REQUIREDAMOUNTOFVOTES = 100;
-    uint8 constant WINNINGAMOUNT = 51;
+    uint8 constant WINNINGAMOUNT = 25;
+
+    // Addresses of the contracts that live at slots 11 and 12 — baked in at deploy time
+    // so that initialize() can extend the shared contracts[] array correctly.
+    address immutable PENDING_IMPORTS_ADDR;
+    address immutable IMPORTS_ADDR;
+
+    // VDXF route keys — must match the constants in PendingImports.sol
+    bytes32 constant GET_PENDING_IMPORTS_VDXF_KEY         = keccak256("getPendingImports");
+    bytes32 constant GET_PENDING_IMPORT_COUNT_VDXF_KEY    = keccak256("getPendingImportCount");
+    bytes32 constant PENDING_IMPORTS_CONTRACT_INDEX_KEY     = keccak256("PendingImports.contract.index");
+    bytes32 constant IMPORTS_CONTRACT_INDEX_KEY           = keccak256("Imports.contract.index");
+    bytes32 constant APPROVE_OR_REJECT_IMPORT_VDXF_KEY    = keccak256("approveOrRejectAcceptedImport");
+    bytes32 constant EXECUTE_TIMED_OUT_IMPORT_VDXF_KEY    = keccak256("executeTimedOutImport");
+    bytes32 constant IS_BRIDGE_PAUSED_VDXF_KEY            = keccak256("isBridgePaused");
+    bytes32 constant GET_NOTARY_IADDRESS_VDXF_KEY         = keccak256("getNotaryIAddress");
+    bytes32 constant SUBMIT_UNHALT_VOTE_VDXF_KEY          = keccak256("submitUnhaltVote");
 
     event contractUpdated(bool);
 
+    constructor(address PendingImports, address imports) {
+        PENDING_IMPORTS_ADDR = PendingImports;
+        IMPORTS_ADDR       = imports;
+    }
+
+    /// @notice Extends the shared contracts[] array to include PendingImports (slot 11)
+    ///         and Imports (slot 12), and registers their VDXF dispatch routes.
+    ///         Called via delegatecall by Delegator.replacecontract() or by
+    ///         checkValidContractUpgrade() whenever the UpgradeManager is itself upgraded.
+    ///
+    ///         When contracts.length == 11 (first extension): pushes both addresses,
+    ///           registers all VDXF route keys, and records the slot-index keys.
+    ///         When contracts.length == 12: pushes only Imports (slot 12).
+    ///         When contracts.length >= 13: no-op — upgrade loop handles replacements.
     function initialize() external {
-        rollingVoteIndex = VerusConstants.DEFAULT_INDEX_VALUE;
+        if (contracts.length == 11) {
+            contracts.push(PENDING_IMPORTS_ADDR);
+            contracts.push(IMPORTS_ADDR);
+            storageGlobal[GET_PENDING_IMPORTS_VDXF_KEY]      = abi.encode(uint256(11));
+            storageGlobal[GET_PENDING_IMPORT_COUNT_VDXF_KEY] = abi.encode(uint256(11));
+            storageGlobal[APPROVE_OR_REJECT_IMPORT_VDXF_KEY] = abi.encode(uint256(11));
+            storageGlobal[EXECUTE_TIMED_OUT_IMPORT_VDXF_KEY] = abi.encode(uint256(11));
+            storageGlobal[IS_BRIDGE_PAUSED_VDXF_KEY]         = abi.encode(uint256(11));
+            storageGlobal[GET_NOTARY_IADDRESS_VDXF_KEY]      = abi.encode(uint256(11));
+            storageGlobal[PENDING_IMPORTS_CONTRACT_INDEX_KEY]   = abi.encode(uint256(11));
+            storageGlobal[SUBMIT_UNHALT_VOTE_VDXF_KEY]       = abi.encode(uint256(11));
+            storageGlobal[IMPORTS_CONTRACT_INDEX_KEY]         = abi.encode(uint256(12));
+        } else if (contracts.length == 12) {
+            contracts.push(IMPORTS_ADDR);
+            storageGlobal[IMPORTS_CONTRACT_INDEX_KEY] = abi.encode(uint256(12));
+        }
+        // contracts.length >= 13: fully extended; upgrade loop handles replacements.
     }
 
     function upgradeContracts(bytes calldata data) external payable returns (uint8) {
 
+        require(msg.value == 0, "Upgrade does not accept ETH");
+
         VerusObjects.upgradeInfo memory _newContractPackage;
 
         (_newContractPackage) = abi.decode(data, (VerusObjects.upgradeInfo));
-        
+
         checkValidContractUpgrade(_newContractPackage);
             
         return PENDING; 
@@ -63,7 +111,7 @@ contract UpgradeManager is VerusStorage {
         require(contractsHash != address(0), "Invalid contract hash");
 
         // If the vote on the hash has already been used, then we can't use it again.
-        if (getVoteCount(contractsHash) > 25 && successfulVoteHashes[contractsHash] != VerusConstants.MAX_UINT256) {
+        if (getVoteCount(contractsHash) > WINNINGAMOUNT && successfulVoteHashes[contractsHash] != VerusConstants.MAX_UINT256) {
             
             // Set the upgrade hash address as used
             successfulVoteHashes[contractsHash] = VerusConstants.MAX_UINT256;
@@ -71,7 +119,7 @@ contract UpgradeManager is VerusStorage {
             // reset the rolling vote index to default viewer.
             rollingVoteIndex = VerusConstants.DEFAULT_INDEX_VALUE;
 
-            for (uint j = 0; j < uint(VerusConstants.NUMBER_OF_CONTRACTS); j++)
+            for (uint j = 0; j < contractsLength; j++)
             {       
                 if (contracts[j] != _newContractPackage.contracts[j]) {
                     contracts[j] = _newContractPackage.contracts[j];
@@ -135,7 +183,7 @@ contract UpgradeManager is VerusStorage {
         }
         else 
         {   
-            output = abi.encodePacked(uint8(254),uint8(newNumber & 0xff),uint8(newNumber >> 8),uint8(newNumber >> 16),uint8(newNumber >> 24),uint8(newNumber >> 32),uint8(newNumber >> 40),uint8(newNumber >> 48),uint8(newNumber >> 56));
+            output = abi.encodePacked(uint8(255),uint8(newNumber & 0xff),uint8(newNumber >> 8),uint8(newNumber >> 16),uint8(newNumber >> 24),uint8(newNumber >> 32),uint8(newNumber >> 40),uint8(newNumber >> 48),uint8(newNumber >> 56));
         }
         return output;
     }

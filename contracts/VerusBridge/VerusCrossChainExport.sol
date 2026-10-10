@@ -34,10 +34,18 @@ contract VerusCrossChainExport is VerusStorage {
     }
 
     function initialize() external {
-        VatLike vat = VatLike(PotLike(pot).vat());
-        vat.hope(daiJoin);
-        vat.hope(pot);
-        IERC20(DAIERC20).approve(daiJoin, uint256(int256(-1)));
+        // NOTE: removed as already ran.
+        // VatLike vat = VatLike(PotLike(pot).vat());
+        // vat.hope(daiJoin);
+        // vat.hope(pot);
+        // IERC20(DAIERC20).approve(daiJoin, uint256(int256(-1)));
+    }
+
+    // Called by Delegator.setVerusData() to resolve a function name to its implementation contract index.
+    function checkVDFXId(string calldata vdxfid) external view returns (uint) {
+        bytes memory stored = storageGlobal[keccak256(abi.encodePacked(vdxfid))];
+        require(stored.length > 0, "VDXF not registered");
+        return abi.decode(stored, (uint));
     }
 
     uint256 constant RAY = 10 ** 27;

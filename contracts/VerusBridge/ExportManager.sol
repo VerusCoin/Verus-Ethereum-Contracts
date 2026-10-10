@@ -7,20 +7,37 @@ import "../Libraries/VerusObjects.sol";
 import "../Libraries/VerusObjectsCommon.sol";
 import "../Libraries/VerusConstants.sol";
 import "../Storage/StorageMaster.sol";
+import "./VerusCrossChainExport.sol";
 
 contract ExportManager is VerusStorage  {
 
     address immutable VETH;
     address immutable BRIDGE;
     address immutable VERUS;
-    bool runonce;
+    address immutable DAIERC20ADDRESS;   // added for token payout functions moved from TokenManager
 
-    constructor(address vETH, address Bridge, address Verus){
+    // ── Token payout constants (selectors hardcoded to avoid Token/IERC721/IERC1155 imports) ──
+    uint8 constant SEND_FAILED            = 1;
+    uint8 constant SEND_SUCCESS           = 2;
+    uint8 constant SEND_SUCCESS_ERC1155   = 3;
+    uint8 constant SEND_SUCCESS_ERC721    = 4;
+    uint8 constant SEND_SUCCESS_ERC20_MINTED = 5;
+    uint8 constant SEND_SUCCESS_ETH       = 6;
+    bytes4 constant ERC20_SEND_SELECTOR   = bytes4(0xa9059cbb); // ERC20.transfer(address,uint256)
+    bytes4 constant ERC20_MINT_SELECTOR   = bytes4(0x40c10f19); // Token.mint(address,uint256)
+    bytes4 constant ERC721_SEND_SELECTOR  = bytes4(0x23b872dd); // IERC721.transferFrom(address,address,uint256)
+    bytes4 constant ERC1155_SEND_SELECTOR = bytes4(0xf242432a); // IERC1155.safeTransferFrom(address,address,uint256,uint256,bytes)
 
-        VETH = vETH;
-        BRIDGE = Bridge;
-        VERUS = Verus;
+    constructor(address vETH, address Bridge, address Verus, address daiERC20Address){
+
+        VETH             = vETH;
+        BRIDGE           = Bridge;
+        VERUS            = Verus;
+        DAIERC20ADDRESS  = daiERC20Address;
     }
+
+    //reset to empty 9-July-26
+    function initialize() external {}
 
     uint8 constant UINT160_SIZE = 20; 
     uint8 constant FEE_OFFSET = 20 + 20 + 20 + 8; // 3 x 20bytes address + 64bit uint // 3 x 20bytes address + 64bit uint
@@ -77,6 +94,7 @@ contract ExportManager is VerusStorage  {
 
         } else {
             
+            require(transfer.fees <= uint64(type(int64).max), "fee too large");
             transferFee = int64(transfer.fees);
 
             require(transfer.feecurrencyid == VETH, "Fee Currency not vETH"); //TODO:Accept more fee currencies
@@ -114,11 +132,13 @@ contract ExportManager is VerusStorage  {
                 transferFee += bounceBackFee;
                 requiredFees += convertFromVerusNumber(uint64(bounceBackFee),18);  //bounceback fees required as well as send fees
 
-            } else if (!(transfer.destination.destinationtype == VerusConstants.DEST_PKH || transfer.destination.destinationtype == VerusConstants.DEST_ID)) {
-
-                return 0;  
-
-            } 
+            } else if (transfer.destination.destinationtype == VerusConstants.DEST_PKH ||
+                       transfer.destination.destinationtype == VerusConstants.DEST_ID) {
+                require(transfer.destination.destinationaddress.length == VerusConstants.UINT160_SIZE,
+                        "destination address not 20 bytes");
+            } else {
+                return 0;
+            }
 
         }
 
@@ -252,5 +272,76 @@ contract ExportManager is VerusStorage  {
         }
       
         return c;
+    }
+
+    function getReadyExportsByRange(uint _startBlock, uint _endBlock) external view returns(VerusObjects.CReserveTransferSetCalled[] memory returnedExports){
+
+        uint outputSize;
+        uint heights = _startBlock;
+        bool loop = cceLastEndHeight > 0;
+
+        if (!loop) return returnedExports;
+
+        while (loop) {
+            heights = _readyExports[heights].endHeight + 1;
+            if (heights > _endBlock || heights == 1) {
+                break;
+            }
+            outputSize++;
+        }
+
+        returnedExports = new VerusObjects.CReserveTransferSetCalled[](outputSize);
+        VerusObjects.CReserveTransferSet memory tempSet;
+        heights = _startBlock;
+
+        for (uint i = 0; i < outputSize; i++) {
+            tempSet = _readyExports[heights];
+            returnedExports[i] = VerusObjects.CReserveTransferSetCalled(tempSet.exportHash, tempSet.prevExportHash, uint64(heights), tempSet.endHeight, tempSet.transfers);
+            heights = tempSet.endHeight + 1;
+        }
+        return returnedExports;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TOKEN PAYOUT FUNCTIONS  (moved from TokenManager / Imports.sol)
+    // sendCurrencyToETHAddress and recordToken are called via delegatecall
+    // from Imports.importTransactions / Imports.launchToken respectively.
+    // ════════════════════════════════════════════════════════════════════════
+    function sendCurrencyToETHAddress(
+        address tokenERCAddress,
+        address destinationAddress,
+        uint256 sendAmount,
+        uint32 selector,
+        uint256 TokenId
+    ) public returns (uint8) {
+
+        bytes memory data;
+        uint256 amount;
+        bool success;
+
+        if (selector == uint32(ERC20_MINT_SELECTOR) || selector == uint32(ERC20_SEND_SELECTOR)) {
+            (success, data) = tokenERCAddress.call{gas: 30000}(abi.encodeWithSelector(bytes4(0x313ce567))); // ERC20.decimals()
+            if (!success || data.length != 32) return SEND_FAILED;
+            uint256 dec = abi.decode(data, (uint256));
+            if (dec > 18) return SEND_FAILED;
+            amount = convertFromVerusNumber(sendAmount, uint8(dec));
+        }
+
+        if (tokenERCAddress == DAIERC20ADDRESS) {
+            address ccx = contracts[uint(VerusConstants.ContractType.VerusCrossChainExport)];
+            (success,) = ccx.delegatecall(abi.encodeWithSelector(VerusCrossChainExport.exit.selector, destinationAddress, amount));
+            return success ? SEND_SUCCESS : SEND_FAILED;
+        } else if (selector == uint32(ERC20_MINT_SELECTOR) || selector == uint32(ERC20_SEND_SELECTOR)) {
+            data = abi.encodeWithSelector(bytes4(selector), destinationAddress, amount);
+        } else if (selector == uint32(ERC721_SEND_SELECTOR)) {
+            data = abi.encodeWithSelector(bytes4(selector), address(this), destinationAddress, TokenId);
+        } else if (selector == uint32(ERC1155_SEND_SELECTOR)) {
+            data = abi.encodeWithSelector(bytes4(selector), address(this), destinationAddress, TokenId, sendAmount, "");
+        }
+
+        (success, data) = tokenERCAddress.call{gas: 100000}(data);
+        if (!success) return SEND_FAILED;
+        if (data.length != 0 && (data.length != 32 || abi.decode(data, (uint256)) == 0)) return SEND_FAILED;
+        return selector == uint32(ERC20_MINT_SELECTOR) ? SEND_SUCCESS_ERC20_MINTED : SEND_SUCCESS;
     }
 }
